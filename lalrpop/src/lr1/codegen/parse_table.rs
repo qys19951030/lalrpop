@@ -715,6 +715,31 @@ impl<'ascent, 'grammar, W: Write> CodeGenerator<'ascent, 'grammar, W, TableDrive
             "{p}state_machine::Parser::drive(",
             p = self.prefix,
         );
+        self.write_state_machine_expr(&phantom_data_expr)?;
+        rust!(self.out, "{p}tokens,", p = self.prefix);
+        rust!(self.out, ")");
+
+        // Close the ordinary `parse` method, but keep the surrounding `impl`
+        // block open so the recovery-aware method below lands in the same
+        // block. `write_recovery_parser_fn` closes the `impl` itself.
+        rust!(self.out, "}}"); // fn parse
+
+        self.write_recovery_parser_fn()?;
+
+        // The recovery helper is a free function in this parse submodule,
+        // where the `StateMachine` type and its (possibly higher-ranked)
+        // generic parameters are in scope.
+        self.write_recovery_helper_fn()?;
+
+        // The grammar-visible result wrapper, also in the parse submodule.
+        self.write_recovery_result_struct()
+    }
+
+    /// Writes the construction of the private `StateMachine` value that
+    /// implements `ParserDefinition`, threading through the grammar
+    /// parameters. The resulting expression is passed as the first argument to
+    /// one of the `state_machine::Parser` driver entry points.
+    fn write_state_machine_expr(&mut self, phantom_data_expr: &str) -> io::Result<()> {
         rust!(self.out, "{p}StateMachine {{", p = self.prefix);
         for Parameter { name, .. } in &self.grammar.parameters {
             rust!(self.out, "{},", name);
@@ -726,10 +751,248 @@ impl<'ascent, 'grammar, W: Write> CodeGenerator<'ascent, 'grammar, W, TableDrive
             phantom = phantom_data_expr,
         );
         rust!(self.out, "}},");
-        rust!(self.out, "{p}tokens,", p = self.prefix);
-        rust!(self.out, ")");
+        Ok(())
+    }
 
-        self.end_parser_fn()
+    /// Writes a second public method on the generated parser,
+    /// `parse_with_error_recovery`, which returns both the success value and
+    /// the error recoveries collected by the state machine. It delegates to
+    /// the private `__parse_with_error_recovery` free function in the same
+    /// parse submodule, so this signature never has to name the private
+    /// `StateMachine` type or its higher-ranked parameters. This closes the
+    /// `impl` block opened by `start_parser_fn`.
+    fn write_recovery_parser_fn(&mut self) -> io::Result<()> {
+        let parse_error_type = self.types.parse_error_type();
+        let result_type = self.recovery_result_type();
+
+        let intern_token = self.grammar.intern_token.is_some();
+        let type_parameters = if intern_token {
+            vec![]
+        } else {
+            let mut user_type_parameters = String::new();
+            for type_parameter in &self.grammar.type_parameters {
+                user_type_parameters.push_str(&format!("{type_parameter}, "));
+            }
+            vec![
+                format!(
+                    "{}TOKEN: {}ToTriple<{}>",
+                    self.prefix, self.prefix, user_type_parameters,
+                ),
+                format!(
+                    "{}TOKENS: IntoIterator<Item={}TOKEN>",
+                    self.prefix, self.prefix
+                ),
+            ]
+        };
+        let parameters = if intern_token {
+            vec![]
+        } else {
+            vec![format!("{}tokens0: {}TOKENS", self.prefix, self.prefix)]
+        };
+
+        rust!(self.out, "");
+        rust!(self.out, "#[allow(dead_code)]");
+        self.out
+            .fn_header(
+                &self.grammar.nonterminals[&self.start_symbol].visibility,
+                "parse_with_error_recovery".to_owned(),
+            )
+            .with_parameters(Some("&self".to_owned()))
+            .with_grammar(self.grammar)
+            .with_type_parameters(type_parameters)
+            .with_parameters(parameters)
+            .with_return_type(format!(
+                "Result<{result_type}, {parse_error_type}>",
+                result_type = result_type,
+                parse_error_type = parse_error_type,
+            ))
+            .emit()?;
+        rust!(self.out, "{{");
+
+        if intern_token {
+            rust!(self.out, "let _ = self.builder;");
+            rust!(
+                self.out,
+                "let mut {p}tokens = self.builder.matcher(input);",
+                p = self.prefix,
+            );
+        } else {
+            rust!(
+                self.out,
+                "let {p}tokens = {p}tokens0.into_iter();",
+                p = self.prefix
+            );
+            rust!(
+                self.out,
+                "let mut {p}tokens = {p}tokens.map(|t| {p}ToTriple::to_triple(t));",
+                p = self.prefix
+            );
+        }
+
+        // The helper takes the same grammar-level parameters and token
+        // iterator as `parse`. Turbofish only the grammar's *type* (non-
+        // lifetime) parameters: lifetimes are inferred and naming them
+        // explicitly is an error when late-bound parameters are present
+        // (E0794), whereas a generic used only inside the helper body (e.g.
+        // via the `StateMachine` phantom or a custom error type) cannot be
+        // inferred at all and must be named.
+        let grammar_type_args = self
+            .grammar
+            .type_parameters
+            .iter()
+            .filter_map(|tp| match tp {
+                TypeParameter::Lifetime(_) => None,
+                TypeParameter::Id(id) => Some(format!("{id}")),
+            })
+            .join(", ");
+        if grammar_type_args.is_empty() {
+            rust!(self.out, "{p}__parse_with_error_recovery(", p = self.prefix);
+        } else {
+            rust!(
+                self.out,
+                "{p}__parse_with_error_recovery::<{args}>(",
+                p = self.prefix,
+                args = grammar_type_args,
+            );
+        }
+        for Parameter { name, .. } in &self.grammar.parameters {
+            rust!(self.out, "{},", name);
+        }
+        rust!(self.out, "{p}tokens)", p = self.prefix);
+
+        rust!(self.out, "}}"); // fn parse_with_error_recovery
+        rust!(self.out, "}}"); // impl
+        Ok(())
+    }
+
+    /// The name of the grammar-level recovery result wrapper type generated
+    /// for the start symbol, including the grammar's generic parameters.
+    fn recovery_result_type(&self) -> String {
+        format!(
+            "{p}__RecoveryResult<{stp}>",
+            p = self.prefix,
+            stp = Sep(", ", &self.grammar.type_parameters),
+        )
+    }
+
+    /// Writes the `__RecoveryResult` wrapper struct. This is the
+    /// grammar-visible shape of a successful recovery-aware parse: the success
+    /// value plus the collected recoveries. It wraps the runtime's
+    /// `lalrpop_util::ParseRecoveryResult` so the grammar's public API never
+    /// has to name the private `StateMachine` type (whose generic parameters,
+    /// such as higher-ranked lifetimes, are not in scope on the parser
+    /// struct's methods).
+    ///
+    /// The struct is parameterized by *all* of the grammar's type parameters
+    /// rather than a filtered set: a custom error type such as `L::Error` can
+    /// reference a generic through an associated type whose free-variable
+    /// analysis does not surface `L`, so filtering would silently drop a
+    /// parameter the field type still names. The extra (possibly unused)
+    /// parameters are acceptable for this internal, generated type.
+    fn write_recovery_result_struct(&mut self) -> io::Result<()> {
+        let success_type = self.types.nonterminal_type(&self.start_symbol);
+        let error_recovery_type = self.types.error_recovery_type();
+        let phantom_data_type = self.phantom_data_type();
+
+        rust!(self.out, "");
+        // No built-in derives: grammar success types are not required to be
+        // `Clone` or `Debug`, so deriving either would impose new bounds on
+        // every generated parser. Tests that need to inspect the result do so
+        // through the public fields directly.
+        //
+        // `allow(dead_code)` because a grammar may generate this type without
+        // ever calling `parse_with_error_recovery`, and some crates compile
+        // with `#![deny(dead_code)]`.
+        rust!(self.out, "#[allow(dead_code)]");
+        rust!(
+            self.out,
+            "pub struct {p}__RecoveryResult<{stp}>",
+            p = self.prefix,
+            stp = Sep(", ", &self.grammar.type_parameters),
+        );
+        if !self.grammar.where_clauses.is_empty() {
+            rust!(
+                self.out,
+                " where {}",
+                Sep(", ", &self.grammar.where_clauses)
+            );
+        }
+        rust!(self.out, " {{");
+        rust!(self.out, "#[allow(dead_code)]");
+        rust!(
+            self.out,
+            "pub result: {success_type},",
+            success_type = success_type,
+        );
+        rust!(self.out, "#[allow(dead_code)]");
+        rust!(
+            self.out,
+            "pub recoveries: alloc::vec::Vec<{error_recovery_type}>,",
+            error_recovery_type = error_recovery_type,
+        );
+        // A marker that mentions every grammar parameter so unused ones do not
+        // trigger E0392 and the where-clauses stay well-formed.
+        rust!(
+            self.out,
+            "{p}_marker: {phantom},",
+            p = self.prefix,
+            phantom = phantom_data_type,
+        );
+        rust!(self.out, "}}");
+        Ok(())
+    }
+
+    /// Writes the private free function that actually drives the state machine
+    /// via `Parser::drive_with_error_recovery`. It is generic over the
+    /// grammar-level parameters (the same ones declared on the grammar and
+    /// used by `parse`), so it never has to name the machine's internal
+    /// higher-ranked generics. The runtime result is mapped into the
+    /// grammar-level `__RecoveryResult` wrapper so callers never see the
+    /// private `StateMachine` type.
+    fn write_recovery_helper_fn(&mut self) -> io::Result<()> {
+        let phantom_data_expr = self.phantom_data_expr();
+        let parse_error_type = self.types.parse_error_type();
+        let result_type = self.recovery_result_type();
+        let triple_type = self.types.triple_type();
+
+        rust!(self.out, "");
+        rust!(self.out, "#[allow(dead_code)]");
+        self.out
+            .fn_header(
+                &Visibility::Priv,
+                format!("{}__parse_with_error_recovery", self.prefix),
+            )
+            .with_grammar(self.grammar)
+            .with_parameters(vec![format!(
+                "mut {p}tokens: impl Iterator<Item = Result<{triple}, {parse_error_type}>>",
+                p = self.prefix,
+                triple = triple_type,
+                parse_error_type = parse_error_type,
+            )])
+            .with_return_type(format!(
+                "Result<{result_type}, {parse_error_type}>",
+                result_type = result_type,
+                parse_error_type = parse_error_type,
+            ))
+            .emit()?;
+        rust!(self.out, "{{");
+        rust!(self.out, "let {p}out = ", p = self.prefix);
+        rust!(
+            self.out,
+            "{p}state_machine::Parser::drive_with_error_recovery(",
+            p = self.prefix,
+        );
+        self.write_state_machine_expr(&phantom_data_expr)?;
+        rust!(self.out, "{p}tokens,", p = self.prefix);
+        rust!(self.out, ")?;");
+        rust!(
+            self.out,
+            "Ok({p}__RecoveryResult {{ result: {p}out.result, recoveries: {p}out.recoveries, {p}_marker: {phantom} }})",
+            p = self.prefix,
+            phantom = phantom_data_expr,
+        );
+        rust!(self.out, "}}");
+        Ok(())
     }
 
     fn write_token_to_integer_fn(&mut self) -> io::Result<()> {

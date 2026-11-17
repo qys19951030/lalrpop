@@ -6645,6 +6645,53 @@ ___phantom: core::marker::PhantomData::<(&())>,
 ___tokens,
 )
 }
+
+#[allow(dead_code)]
+pub fn parse_with_error_recovery<
+    'input,
+    ___TOKEN: ___ToTriple<'input, >,
+    ___TOKENS: IntoIterator<Item=___TOKEN>,
+>(
+&self,
+text: &'input str,
+___tokens0: ___TOKENS,
+) -> Result<_____RecoveryResult<'input>, ___lalrpop_util::ParseError<usize, Tok<'input>, tok::Error>>
+{
+let ___tokens = ___tokens0.into_iter();
+let mut ___tokens = ___tokens.map(|t| ___ToTriple::to_triple(t));
+_____parse_with_error_recovery(
+text,
+___tokens)
+}
+}
+
+#[allow(dead_code)]
+fn _____parse_with_error_recovery<
+    'input,
+>(
+text: &'input str,
+mut ___tokens: impl Iterator<Item = Result<(usize, Tok<'input>, usize), ___lalrpop_util::ParseError<usize, Tok<'input>, tok::Error>>>,
+) -> Result<_____RecoveryResult<'input>, ___lalrpop_util::ParseError<usize, Tok<'input>, tok::Error>>
+{
+let ___out = 
+___state_machine::Parser::drive_with_error_recovery(
+___StateMachine {
+text,
+___phantom: core::marker::PhantomData::<(&())>,
+},
+___tokens,
+)?;
+Ok(_____RecoveryResult { result: ___out.result, recoveries: ___out.recoveries, ____marker: core::marker::PhantomData::<(&())> })
+}
+
+#[allow(dead_code)]
+pub struct _____RecoveryResult<'input>
+ {
+#[allow(dead_code)]
+pub result: Top,
+#[allow(dead_code)]
+pub recoveries: alloc::vec::Vec<___lalrpop_util::ErrorRecovery<usize, Tok<'input>, tok::Error>>,
+____marker: core::marker::PhantomData<(&'input ())>,
 }
 fn ___accepts<
     'input,
