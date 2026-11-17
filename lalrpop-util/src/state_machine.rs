@@ -194,6 +194,52 @@ pub type TokenTriple<D> = (Location<D>, Token<D>, Location<D>);
 pub type SymbolTriple<D> = (Location<D>, Symbol<D>, Location<D>);
 pub type ErrorRecovery<D> = crate::ErrorRecovery<Location<D>, Token<D>, Error<D>>;
 
+/// The result of driving a parser while collecting its error recoveries.
+///
+/// Returned by [`Parser::drive_with_error_recovery`]. On a successful parse,
+/// `result` holds the success value and `recoveries` holds one
+/// [`crate::ErrorRecovery`] record for each recovery the state machine
+/// performed, in the order they were encountered (an empty vector if the
+/// input was entirely valid). If parsing fails irrecoverably,
+/// [`Parser::drive_with_error_recovery`] returns the [`ParseError`] directly,
+/// just like [`Parser::drive`].
+pub struct ParseRecoveryResult<D: ParserDefinition> {
+    /// The success value produced by the parse.
+    pub result: Success<D>,
+    /// The error recoveries performed during the parse, in encounter order.
+    pub recoveries: Vec<ErrorRecovery<D>>,
+}
+
+impl<D: ParserDefinition> Clone for ParseRecoveryResult<D>
+where
+    Success<D>: Clone,
+    Error<D>: Clone,
+    Location<D>: Clone,
+    Token<D>: Clone,
+{
+    fn clone(&self) -> Self {
+        ParseRecoveryResult {
+            result: self.result.clone(),
+            recoveries: self.recoveries.clone(),
+        }
+    }
+}
+
+impl<D: ParserDefinition> Debug for ParseRecoveryResult<D>
+where
+    Success<D>: Debug,
+    Error<D>: Debug,
+    Location<D>: Debug,
+    Token<D>: Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ParseRecoveryResult")
+            .field("result", &self.result)
+            .field("recoveries", &self.recoveries)
+            .finish()
+    }
+}
+
 pub struct Parser<D, I>
 where
     D: ParserDefinition,
@@ -204,6 +250,11 @@ where
     states: Vec<D::StateIndex>,
     symbols: Vec<SymbolTriple<D>>,
     last_location: D::Location,
+    /// `Some` when the parser was started via
+    /// [`Parser::drive_with_error_recovery`]; every performed recovery is
+    /// appended here in encounter order. `None` when driven via
+    /// [`Parser::drive`], whose observable behavior must remain unchanged.
+    recoveries: Option<Vec<ErrorRecovery<D>>>,
 }
 
 enum NextToken<D: ParserDefinition> {
@@ -226,8 +277,41 @@ where
             states: vec![start_state],
             symbols: vec![],
             last_location,
+            recoveries: None,
         }
         .parse()
+    }
+
+    /// Like [`Parser::drive`], but additionally records every error recovery
+    /// performed by the state machine.
+    ///
+    /// On a successful parse, returns a [`ParseRecoveryResult`] containing the
+    /// success value together with one [`crate::ErrorRecovery`] record per
+    /// recovery, in encounter order. On an irrecoverable error, returns the
+    /// same [`ParseError`] that [`Parser::drive`] would have returned; the
+    /// partially collected recoveries are discarded in that case.
+    ///
+    /// The stack truncation, recovery-symbol push and all other state machine
+    /// behavior are identical to [`Parser::drive`], so the success value for a
+    /// given input is byte-for-byte the same through either entry point.
+    pub fn drive_with_error_recovery(
+        definition: D,
+        tokens: I,
+    ) -> Result<ParseRecoveryResult<D>, ParseError<D>> {
+        let last_location = definition.start_location();
+        let start_state = definition.start_state();
+        let mut parser = Parser {
+            definition,
+            tokens,
+            states: vec![start_state],
+            symbols: vec![],
+            last_location,
+            recoveries: Some(vec![]),
+        };
+        parser.parse().map(|result| ParseRecoveryResult {
+            result,
+            recoveries: parser.recoveries.take().unwrap(),
+        })
     }
 
     fn top_state(&self) -> D::StateIndex {
@@ -506,10 +590,18 @@ where
         let error_action = self.definition.error_action(recover_state);
         let error_state = error_action.as_shift().unwrap();
         self.states.push(error_state);
-        let recovery = self.definition.error_recovery_symbol(crate::ErrorRecovery {
+        let error_recovery = crate::ErrorRecovery {
             error,
             dropped_tokens,
-        });
+        };
+        // When driven through `drive_with_error_recovery`, record the same
+        // recovery information that is handed to the grammar action. This
+        // only reads the data; the stack truncation above and the symbol push
+        // below happen identically either way.
+        if let Some(recoveries) = self.recoveries.as_mut() {
+            recoveries.push(error_recovery.clone());
+        }
+        let recovery = self.definition.error_recovery_symbol(error_recovery);
         self.symbols.push((start, recovery, end));
 
         match (opt_lookahead, opt_token_index) {

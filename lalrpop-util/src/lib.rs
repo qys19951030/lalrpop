@@ -22,6 +22,8 @@ use core::fmt;
 pub mod lexer;
 pub mod state_machine;
 
+pub use state_machine::ParseRecoveryResult;
+
 /// Error type for errors returned by lalrpop parsers.
 ///
 /// For the built-in lexer, the generic parameters default to:
@@ -220,12 +222,49 @@ where
 /// book](https://lalrpop.github.io/lalrpop/tutorial/008_error_recovery.html).
 ///
 /// This is the type of the variable resulting from binding a `!` symbol in your lalrpop grammar.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ErrorRecovery<L, T, E> {
     /// The parse error that was recovered from
     pub error: ParseError<L, T, E>,
     /// The tokens discarded prior to resuming parsing
     pub dropped_tokens: Vec<(L, T, L)>,
+}
+
+// A manual `Clone` impl with looser bounds than the one the derive would
+// generate: recovering only needs the location and token types to be `Clone`,
+// not the user error type. This lets the runtime collect a copy of every
+// recovery for grammars whose custom error type is not `Clone`.
+impl<L: Clone, T: Clone, E> Clone for ErrorRecovery<L, T, E> {
+    fn clone(&self) -> Self {
+        ErrorRecovery {
+            error: match &self.error {
+                ParseError::InvalidToken { location } => ParseError::InvalidToken {
+                    location: location.clone(),
+                },
+                ParseError::UnrecognizedEof { location, expected } => ParseError::UnrecognizedEof {
+                    location: location.clone(),
+                    expected: expected.clone(),
+                },
+                ParseError::UnrecognizedToken { token, expected } => {
+                    ParseError::UnrecognizedToken {
+                        token: (token.0.clone(), token.1.clone(), token.2.clone()),
+                        expected: expected.clone(),
+                    }
+                }
+                ParseError::ExtraToken { token } => ParseError::ExtraToken {
+                    token: (token.0.clone(), token.1.clone(), token.2.clone()),
+                },
+                ParseError::User { .. } => {
+                    panic!("cannot clone an ErrorRecovery containing a user error")
+                }
+            },
+            dropped_tokens: self
+                .dropped_tokens
+                .iter()
+                .map(|(s, t, e)| (s.clone(), t.clone(), e.clone()))
+                .collect(),
+        }
+    }
 }
 
 #[cfg(not(build_os_windows))]
