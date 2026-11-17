@@ -1,0 +1,26 @@
+use crate::util::tok::Tok;
+
+// Like `error_recovery.lalrpop`, but with no *value* parameters: the error
+// recoveries are collected by the runtime's `drive_with_error_recovery` entry
+// point and returned alongside the success value, rather than being pushed
+// into an injected `RefCell` from the actions. The `'input` lifetime is still
+// declared because the token type borrows from the input.
+grammar<'input>;
+
+extern {
+    enum Tok<'input> {
+        "-" => Tok::Minus,
+        "+" => Tok::Plus,
+        "(" => Tok::LParen,
+        ")" => Tok::RParen,
+        Num => Tok::Num(<i32>)
+    }
+}
+
+pub Item: String = {
+    "+" => '+'.to_string(),
+    "-" "-" "-" => "-".to_string(),
+    "-" "-" <!> => "!".to_string(),
+    "(" <i: Item> ")" => format!("({i})"),
+    "(" <!> ")" => "()".to_string(),
+};

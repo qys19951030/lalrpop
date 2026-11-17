@@ -110,6 +110,7 @@ lalrpop_mod_test!(non_hash_user_error);
 
 /// Test error recovery
 lalrpop_mod_test!(error_recovery);
+lalrpop_mod_test!(error_recovery_collected);
 lalrpop_mod_test!(error_recovery_pull_182);
 lalrpop_mod_test!(error_recovery_issue_240);
 lalrpop_mod_test!(error_recovery_lalr_loop);
@@ -869,6 +870,239 @@ fn error_recovery_span_starts_just_dropped_states() {
     // Here, we drop the `+` in favor of the `-`.
     // Therefore, the span we give is the `+`.
     test_error_recovery_spans("1 + - 4", ". - . .", "1 - 4");
+}
+
+// Tests for the runtime's `drive_with_error_recovery` entry point, exercised
+// through the generated `parse_with_error_recovery` method. These use
+// `error_recovery_collected`, which has no injected collection parameter: the
+// recoveries are gathered by the runtime itself and returned together with the
+// success value. Where useful, the same input is also run through the
+// RefCell-based `error_recovery` grammar and the two recovery lists are
+// compared one record at a time.
+
+/// Tokenize `input` into the bare `Tok` values (with `()` locations) expected
+/// by the external-token `error_recovery` grammars.
+fn tokenize_toks(input: &str) -> Vec<Tok<'_>> {
+    util::tok::tokenize(input)
+        .into_iter()
+        .map(|(_, tok, _)| tok)
+        .collect()
+}
+
+/// The recovery-record type shared by the external-token `error_recovery`
+/// grammars.
+type CollectedRecovery<'input> = ErrorRecovery<(), Tok<'input>, &'static str>;
+
+/// Run `input` through both grammars: the RefCell-collecting one and the
+/// runtime-collecting one. Returns the success value, the RefCell records and
+/// the runtime records, asserting along the way that both parses succeeded and
+/// produced the same success value.
+fn run_both(
+    input: &str,
+) -> (
+    String,
+    Vec<CollectedRecovery<'_>>,
+    Vec<CollectedRecovery<'_>>,
+) {
+    let tokens = tokenize_toks(input);
+
+    let errors = RefCell::new(vec![]);
+    let refcell_result = error_recovery::ItemParser::new()
+        .parse(&errors, tokens.clone())
+        .expect("RefCell grammar should parse successfully");
+
+    let collected = error_recovery_collected::ItemParser::new()
+        .parse_with_error_recovery(tokens)
+        .expect("collected grammar should parse successfully");
+
+    assert_eq!(refcell_result, collected.result, "success values differ");
+    (collected.result, errors.into_inner(), collected.recoveries)
+}
+
+#[test]
+fn error_recovery_collected_valid_input() {
+    // A fully legal input: success value matches `drive`, and the recovery
+    // list is empty.
+    let tokens = tokenize_toks("+");
+    let result = error_recovery_collected::ItemParser::new()
+        .parse_with_error_recovery(tokens)
+        .expect("valid input should parse");
+
+    assert_eq!(result.result, "+".to_string());
+    assert!(result.recoveries.is_empty());
+
+    // The success value is byte-for-byte the same as the ordinary `parse`.
+    let ordinary = error_recovery_collected::ItemParser::new()
+        .parse(tokenize_toks("+"))
+        .unwrap();
+    assert_eq!(result.result, ordinary);
+}
+
+#[test]
+fn error_recovery_collected_single() {
+    // One bad fragment: one recovery, identical to the RefCell records, and
+    // the same success value as `drive`.
+    let (result, refcell_errors, collected) = run_both("(++)");
+
+    assert_eq!(result, "()".to_string());
+    assert_eq!(collected.len(), 1);
+    assert_eq!(refcell_errors.len(), 1);
+    assert_eq!(collected, refcell_errors);
+    assert_eq!(
+        collected[0],
+        ErrorRecovery {
+            error: ParseError::UnrecognizedToken {
+                token: ((), Tok::Plus, ()),
+                expected: vec!["\")\"".to_string()],
+            },
+            dropped_tokens: vec![((), Tok::Plus, ())],
+        }
+    );
+}
+
+#[test]
+fn error_recovery_collected_no_dropped_token() {
+    // A recovery that does not drop any lookahead token still records a
+    // recovery with an empty `dropped_tokens`.
+    let (_, refcell_errors, collected) = run_both("(--)");
+
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected, refcell_errors);
+    assert_eq!(
+        collected[0],
+        ErrorRecovery {
+            error: ParseError::UnrecognizedToken {
+                token: ((), Tok::RParen, ()),
+                expected: vec!["\"-\"".to_string()],
+            },
+            dropped_tokens: vec![],
+        }
+    );
+}
+
+#[test]
+fn error_recovery_collected_multiple_in_order() {
+    // Two bad fragments inside one parse: the records appear in encounter
+    // order and match the RefCell grammar record-for-record. The exact
+    // dropped-token contents of each record are verified through the equality
+    // against the RefCell collection rather than hard-coded.
+    let (result, refcell_errors, collected) = run_both("((--)(--))");
+
+    assert_eq!(result, "(())".to_string());
+    assert_eq!(collected.len(), 2);
+    assert_eq!(collected.len(), refcell_errors.len());
+    assert_eq!(collected, refcell_errors);
+
+    // The first recovery drops no lookahead token; the second one does.
+    assert!(collected[0].dropped_tokens.is_empty());
+    assert!(!collected[1].dropped_tokens.is_empty());
+}
+
+#[test]
+fn error_recovery_collected_multiple_dropped_tokens() {
+    // A single recovery can discard several tokens; they are all captured.
+    let (_, refcell_errors, collected) = run_both("(+++)");
+
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected, refcell_errors);
+    assert_eq!(
+        collected[0].dropped_tokens,
+        vec![((), Tok::Plus, ()), ((), Tok::Plus, ())],
+    );
+}
+
+#[test]
+fn error_recovery_collected_eof() {
+    // A recovery triggered at end of file is recorded too.
+    let (result, refcell_errors, collected) = run_both("--");
+
+    assert_eq!(result, "!".to_string());
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected, refcell_errors);
+    assert_eq!(
+        collected[0],
+        ErrorRecovery {
+            error: ParseError::UnrecognizedEof {
+                location: (),
+                expected: vec!["\"-\"".to_string()],
+            },
+            dropped_tokens: vec![],
+        }
+    );
+}
+
+#[test]
+fn error_recovery_collected_order_with_distinct_contents() {
+    // Two recoveries whose dropped-token sets differ. Equality against the
+    // RefCell grammar (which records through the grammar actions) verifies
+    // both the encounter ordering and the per-record contents.
+    let (_, refcell_errors, collected) = run_both("(--)(++)");
+
+    assert_eq!(collected.len(), 2);
+    assert_ne!(
+        collected[0].dropped_tokens, collected[1].dropped_tokens,
+        "the two recoveries should have distinct contents"
+    );
+    assert_eq!(collected, refcell_errors);
+
+    // The first recovery drops nothing; the second recovery does.
+    assert!(collected[0].dropped_tokens.is_empty());
+    assert!(!collected[1].dropped_tokens.is_empty());
+}
+
+#[test]
+fn error_recovery_collected_then_fatal_error() {
+    // If the parser recovers and then hits an error it cannot recover from,
+    // the whole parse fails with the final `ParseError`: no success value and
+    // no half-collected records are handed back.
+    let tokens = tokenize_toks("-");
+    let result = error_recovery_collected::ItemParser::new().parse_with_error_recovery(tokens);
+
+    let expected = ParseError::UnrecognizedEof {
+        location: (),
+        expected: vec!["\"-\"".to_string()],
+    };
+    match result {
+        Err(e) => assert_eq!(e, expected),
+        Ok(_) => panic!("expected an irrecoverable error, got a success value"),
+    }
+
+    // The ordinary `drive`/`parse` reports the identical error.
+    let ordinary = error_recovery_collected::ItemParser::new()
+        .parse(tokenize_toks("-"))
+        .unwrap_err();
+    assert_eq!(ordinary, expected);
+}
+
+#[test]
+fn error_recovery_collected_unsupported_grammar_matches_drive() {
+    // A grammar that does not support error recovery behaves exactly like
+    // `drive`: a legal input succeeds with no recoveries, and a bad input
+    // returns the same `ParseError` through either entry point.
+    let legal = util::tok::tokenize("22 - 5")
+        .into_iter()
+        .map(|(_, tok, _)| tok)
+        .collect::<Vec<_>>();
+
+    let collected = sub_table::SParser::new()
+        .parse_with_error_recovery(legal.clone())
+        .expect("legal input should parse");
+    assert_eq!(collected.result, 17);
+    assert!(collected.recoveries.is_empty());
+
+    let ordinary = sub_table::SParser::new().parse(legal).unwrap();
+    assert_eq!(collected.result, ordinary);
+
+    let bad = util::tok::tokenize("22 -")
+        .into_iter()
+        .map(|(_, tok, _)| tok)
+        .collect::<Vec<_>>();
+    let collected_err = match sub_table::SParser::new().parse_with_error_recovery(bad.clone()) {
+        Err(e) => e,
+        Ok(_) => panic!("unsupported-recovery grammar should not recover"),
+    };
+    let ordinary_err = sub_table::SParser::new().parse(bad).unwrap_err();
+    assert_eq!(collected_err, ordinary_err);
 }
 
 #[test]
